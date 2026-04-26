@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import gi
@@ -205,6 +206,69 @@ def _find_vm_audio_source() -> str:
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
     return "default.monitor"
+
+
+# How often (in seconds) the geometry watcher polls the QEMU window position
+# and size while a recording is active.  Keeping this short enough to detect
+# a guest-resolution change quickly without hammering xdotool.
+_GEOMETRY_POLL_INTERVAL: float = 2.0
+
+
+# ---------------------------------------------------------------------------
+# Geometry watcher (restarts recordings when the QEMU window is resized)
+# ---------------------------------------------------------------------------
+
+
+def _run_geometry_watcher(
+    stop: threading.Event,
+    recorder: "Recorder",
+    pid: int,
+    display: str,
+    output_dir: str,
+    on_restarted: Callable[[str], None],
+    on_failed: Callable[[], None],
+) -> None:
+    """Core geometry-watcher loop; intended to run in a background thread.
+
+    Polls the QEMU window geometry every :data:`_GEOMETRY_POLL_INTERVAL`
+    seconds.  When the window is resized or moved the current recording is
+    stopped and a new one is started with the updated region so that the
+    capture always matches the actual QEMU display area.
+
+    The loop exits when *stop* is set, when *recorder.recording* becomes
+    False, or when a restart attempt fails.
+
+    Callbacks:
+        on_restarted(new_path)  – called after a successful restart with the
+                                   path of the new recording file.
+        on_failed()             – called when a restart attempt fails.
+    """
+    current_region: tuple[int, int, int, int] | None = _get_qemu_window_geometry(pid)
+    if current_region is None:
+        # Cannot establish a baseline; bail out rather than triggering a
+        # spurious restart the first time xdotool returns a valid geometry.
+        return
+    while not stop.wait(_GEOMETRY_POLL_INTERVAL):
+        if not recorder.recording:
+            break
+        new_region = _get_qemu_window_geometry(pid)
+        if new_region is None or new_region == current_region:
+            continue
+        # Geometry changed – stop the current recording and start a new one
+        # with the updated region.  stop() may block briefly while ffmpeg
+        # flushes its buffers; that is acceptable in a background thread.
+        current_region = new_region
+        recorder.stop()
+        if stop.is_set():
+            # The user requested a stop while we were restarting; don't resume.
+            break
+        new_outfile = _video_filename(output_dir)
+        ok = recorder.start(new_outfile, display, region=new_region)
+        if ok:
+            on_restarted(new_outfile)
+        else:
+            on_failed()
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +456,9 @@ class ControlWindow(Gtk.ApplicationWindow):
         # PID of the QEMU process; set by QemuCaviarApp once QEMU has started.
         # Used to look up the QEMU window geometry for window-scoped recording.
         self._qemu_pid: int | None = None
+        # Set to a threading.Event when the geometry watcher is running; the
+        # event is used to signal the watcher thread to exit cleanly.
+        self._geometry_watcher_stop: threading.Event | None = None
 
         self.set_default_size(320, 80)
         self.set_resizable(False)
@@ -505,6 +572,11 @@ class ControlWindow(Gtk.ApplicationWindow):
     # ------------------------------------------------------------------
     def _on_toggle_recording(self, _widget) -> None:
         if self._recorder.recording:
+            # Signal the geometry watcher (if running) to exit before we stop
+            # the recorder, so it cannot race with us and restart the recording.
+            if self._geometry_watcher_stop is not None:
+                self._geometry_watcher_stop.set()
+                self._geometry_watcher_stop = None
             # Stop
             def _stop_in_thread():
                 outfile = self._recorder.stop()
@@ -531,9 +603,49 @@ class ControlWindow(Gtk.ApplicationWindow):
             if ok:
                 self._set_status(f"Recording… → {os.path.basename(outfile)}")
                 self._rec_toggle_item.set_label("_Stop Recording")
+                # When recording a specific window region, watch for QEMU
+                # resizes so the capture region can be updated automatically.
+                if region is not None and self._qemu_pid is not None:
+                    self._geometry_watcher_stop = threading.Event()
+                    threading.Thread(
+                        target=self._geometry_watcher_loop,
+                        args=(display,),
+                        daemon=True,
+                    ).start()
+
+    # ------------------------------------------------------------------
+    def _geometry_watcher_loop(self, display: str) -> None:
+        """Delegate to :func:`_run_geometry_watcher` with this window's state."""
+        stop = self._geometry_watcher_stop
+        pid = self._qemu_pid
+        if stop is None or pid is None:
+            return
+
+        def _on_restarted(path: str) -> None:
+            GLib.idle_add(
+                self._set_status,
+                f"Recording… → {os.path.basename(path)}",
+            )
+
+        def _on_failed() -> None:
+            GLib.idle_add(self._set_status, "Recording failed after resize")
+            GLib.idle_add(self._rec_toggle_item.set_label, "_Start Recording")
+
+        _run_geometry_watcher(
+            stop=stop,
+            recorder=self._recorder,
+            pid=pid,
+            display=display,
+            output_dir=self._output_dir,
+            on_restarted=_on_restarted,
+            on_failed=_on_failed,
+        )
 
     # ------------------------------------------------------------------
     def _on_delete(self, _widget, _event) -> bool:
+        if self._geometry_watcher_stop is not None:
+            self._geometry_watcher_stop.set()
+            self._geometry_watcher_stop = None
         if self._recorder.recording:
             self._recorder.stop()
         return False  # allow window to close

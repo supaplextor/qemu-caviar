@@ -469,6 +469,264 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(qemu_args, ["-hda", "vm.qcow2"])
 
 
+# ---------------------------------------------------------------------------
+# _run_geometry_watcher tests
+# ---------------------------------------------------------------------------
+
+
+class TestRunGeometryWatcher(unittest.TestCase):
+    """Tests for the standalone _run_geometry_watcher function.
+
+    All tests use a near-zero poll interval so the loop ticks quickly without
+    relying on real wall-clock delays.
+    """
+
+    def setUp(self) -> None:
+        # Use a tiny poll interval so tests complete in milliseconds.
+        self._orig_interval = qemu_caviar._GEOMETRY_POLL_INTERVAL
+        qemu_caviar._GEOMETRY_POLL_INTERVAL = 0.01
+
+    def tearDown(self) -> None:
+        qemu_caviar._GEOMETRY_POLL_INTERVAL = self._orig_interval
+
+    def _mock_proc(self):
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.wait = MagicMock(return_value=0)
+        return mock_proc
+
+    def _make_recorder(self, tmpdir: str) -> qemu_caviar.Recorder:
+        recorder = qemu_caviar.Recorder()
+        with patch("subprocess.Popen", return_value=self._mock_proc()):
+            with patch.object(
+                qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
+            ):
+                recorder.start(os.path.join(tmpdir, "initial.mp4"), display=":0")
+        return recorder
+
+    @staticmethod
+    def _noop_on_restarted(path: str) -> None:  # pragma: no cover
+        """Stub callback used when no restart is expected."""
+
+    def test_watcher_restarts_recording_on_resize(self) -> None:
+        """When the QEMU window changes size the watcher must stop the current
+        recording and start a new one with the updated region."""
+        tmpdir = tempfile.mkdtemp()
+        recorder = self._make_recorder(tmpdir)
+
+        initial_geo = (100, 200, 1280, 720)
+        resized_geo = (100, 200, 1024, 768)
+        call_count = [0]
+
+        def fake_geo(_pid):
+            call_count[0] += 1
+            # First call returns the initial region (same as at start).
+            # Subsequent calls return the resized region.
+            return initial_geo if call_count[0] <= 1 else resized_geo
+
+        stop = threading.Event()
+        restarted_paths: list[str] = []
+        failed_calls = [0]
+
+        def on_restarted(path: str) -> None:
+            restarted_paths.append(path)
+            # Stop the watcher after the first successful restart.
+            stop.set()
+
+        def on_failed() -> None:
+            failed_calls[0] += 1
+            stop.set()
+
+        with patch.object(qemu_caviar, "_get_qemu_window_geometry", side_effect=fake_geo):
+            with patch("subprocess.Popen", return_value=self._mock_proc()):
+                with patch.object(
+                    qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
+                ):
+                    qemu_caviar._run_geometry_watcher(
+                        stop=stop,
+                        recorder=recorder,
+                        pid=1234,
+                        display=":0",
+                        output_dir=tmpdir,
+                        on_restarted=on_restarted,
+                        on_failed=on_failed,
+                    )
+
+        self.assertEqual(len(restarted_paths), 1, "Expected exactly one restart")
+        self.assertEqual(failed_calls[0], 0, "Expected no failures")
+        # The new recording should be active.
+        self.assertTrue(recorder.recording)
+        recorder.stop()
+
+    def test_watcher_no_restart_when_geometry_unchanged(self) -> None:
+        """When the window geometry does not change the recorder must not be
+        stopped or restarted."""
+        tmpdir = tempfile.mkdtemp()
+        recorder = self._make_recorder(tmpdir)
+
+        stop = threading.Event()
+        restarted_calls = [0]
+
+        def on_restarted(path: str) -> None:
+            restarted_calls[0] += 1
+
+        def on_failed() -> None:
+            pass
+
+        geo = (0, 0, 1280, 720)
+        tick = [0]
+
+        def fake_geo(_pid):
+            tick[0] += 1
+            if tick[0] >= 3:
+                stop.set()
+            return geo  # always the same
+
+        with patch.object(qemu_caviar, "_get_qemu_window_geometry", side_effect=fake_geo):
+            qemu_caviar._run_geometry_watcher(
+                stop=stop,
+                recorder=recorder,
+                pid=1234,
+                display=":0",
+                output_dir=tmpdir,
+                on_restarted=on_restarted,
+                on_failed=on_failed,
+            )
+
+        self.assertEqual(restarted_calls[0], 0, "Recorder should not have restarted")
+        # Original recording is still active.
+        self.assertTrue(recorder.recording)
+        recorder.stop()
+
+    def test_watcher_exits_cleanly_when_stop_set(self) -> None:
+        """Setting the stop event while the watcher is running must cause the
+        loop to exit without restarting the recorder."""
+        tmpdir = tempfile.mkdtemp()
+        recorder = self._make_recorder(tmpdir)
+
+        stop = threading.Event()
+        # Set the stop event immediately so the watcher exits on first check.
+        stop.set()
+
+        with patch.object(
+            qemu_caviar,
+            "_get_qemu_window_geometry",
+            return_value=(0, 0, 1280, 720),
+        ):
+            qemu_caviar._run_geometry_watcher(
+                stop=stop,
+                recorder=recorder,
+                pid=1234,
+                display=":0",
+                output_dir=tmpdir,
+                on_restarted=self._noop_on_restarted,
+                on_failed=lambda: None,
+            )
+
+        self.assertTrue(recorder.recording)
+        recorder.stop()
+
+    def test_watcher_exits_when_recorder_stops(self) -> None:
+        """The watcher loop must exit when recorder.recording becomes False
+        (e.g. the user stopped the recording from the UI)."""
+        tmpdir = tempfile.mkdtemp()
+        recorder = self._make_recorder(tmpdir)
+
+        stop = threading.Event()
+        call_count = [0]
+
+        def fake_geo(_pid):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                # Simulate the user stopping the recording between polls.
+                recorder.stop()
+            return (0, 0, 1280, 720)
+
+        with patch.object(qemu_caviar, "_get_qemu_window_geometry", side_effect=fake_geo):
+            qemu_caviar._run_geometry_watcher(
+                stop=stop,
+                recorder=recorder,
+                pid=1234,
+                display=":0",
+                output_dir=tmpdir,
+                on_restarted=self._noop_on_restarted,
+                on_failed=lambda: None,
+            )
+
+        self.assertFalse(recorder.recording)
+
+    def test_watcher_does_not_restart_after_stop_signalled_mid_restart(self) -> None:
+        """If the stop event is set while the watcher is between stop() and
+        start() the watcher must not start a new recording."""
+        tmpdir = tempfile.mkdtemp()
+        recorder = self._make_recorder(tmpdir)
+
+        stop = threading.Event()
+        initial_geo = (0, 0, 1280, 720)
+        resized_geo = (0, 0, 1024, 768)
+        call_count = [0]
+
+        def fake_geo(_pid):
+            call_count[0] += 1
+            return initial_geo if call_count[0] <= 1 else resized_geo
+
+        restarted_calls = [0]
+
+        # Patch Recorder.stop to also set the stop event, simulating the user
+        # clicking "Stop" at the exact moment the watcher calls stop().
+        original_stop = recorder.stop
+
+        def stop_and_signal():
+            result = original_stop()
+            stop.set()  # signal watcher not to restart
+            return result
+
+        recorder.stop = stop_and_signal
+
+        with patch.object(qemu_caviar, "_get_qemu_window_geometry", side_effect=fake_geo):
+            with patch("subprocess.Popen", return_value=self._mock_proc()):
+                with patch.object(
+                    qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
+                ):
+                    qemu_caviar._run_geometry_watcher(
+                        stop=stop,
+                        recorder=recorder,
+                        pid=1234,
+                        display=":0",
+                        output_dir=tmpdir,
+                        on_restarted=self._noop_on_restarted,
+                        on_failed=lambda: None,
+                    )
+
+        self.assertEqual(restarted_calls[0], 0, "Should not restart after stop is signalled")
+        self.assertFalse(recorder.recording)
+
+    def test_watcher_exits_early_when_initial_geometry_unavailable(self) -> None:
+        """When xdotool cannot find the QEMU window at watcher start-up the
+        loop must exit without entering the poll cycle at all."""
+        tmpdir = tempfile.mkdtemp()
+        recorder = self._make_recorder(tmpdir)
+
+        stop = threading.Event()
+
+        with patch.object(
+            qemu_caviar, "_get_qemu_window_geometry", return_value=None
+        ):
+            qemu_caviar._run_geometry_watcher(
+                stop=stop,
+                recorder=recorder,
+                pid=1234,
+                display=":0",
+                output_dir=tmpdir,
+                on_restarted=self._noop_on_restarted,
+                on_failed=lambda: None,
+            )
+
+        # Recording should not have been touched.
+        self.assertTrue(recorder.recording)
+        recorder.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
 
