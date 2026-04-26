@@ -203,9 +203,13 @@ class Recorder:
             # so we capture what the VM is playing rather than the host mic.
             "-f", "pulse",
             "-i", audio_source,
-            # Encode video with libx264 (fast preset) and audio with AAC
+            # Encode video with libx264 (fast preset) and audio with AAC.
+            # yuv420p is required for broad player compatibility; x11grab
+            # produces bgr0/bgra frames that libx264 would otherwise encode
+            # in a non-standard pixel format causing garbled colour output.
             "-c:v", "libx264",
             "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             output_path,
         ]

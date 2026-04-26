@@ -223,6 +223,26 @@ class TestRecorder(unittest.TestCase):
         self.assertEqual(captured_cmd[pulse_idx], "my-qemu-sink.monitor")
         recorder.stop()
 
+    def test_pix_fmt_yuv420p_in_ffmpeg_cmd(self) -> None:
+        """yuv420p must be set so x11grab frames are correctly encoded by
+        libx264; omitting it causes garbled colour blocks in the output."""
+        recorder = qemu_caviar.Recorder()
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "test.mp4")
+        captured_cmd: list[str] = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return self._mock_proc()
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            recorder.start(outpath, display=":99", audio_source="default.monitor")
+
+        self.assertIn("-pix_fmt", captured_cmd)
+        pix_fmt_idx = captured_cmd.index("-pix_fmt")
+        self.assertEqual(captured_cmd[pix_fmt_idx + 1], "yuv420p")
+        recorder.stop()
+
     def test_start_without_ffmpeg(self) -> None:
         recorder = qemu_caviar.Recorder()
         tmpdir = tempfile.mkdtemp()
