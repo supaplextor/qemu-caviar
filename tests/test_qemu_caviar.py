@@ -273,18 +273,158 @@ class TestRecorder(unittest.TestCase):
         result = recorder.stop()
         self.assertIsNone(result)
 
-    def test_toggle_starts_then_stops(self) -> None:
+    def test_region_sets_video_size_and_offset_in_ffmpeg_cmd(self) -> None:
+        """When a region is given, -video_size and the display+x,y offset must
+        appear in the ffmpeg command so that only the QEMU window is recorded."""
         recorder = qemu_caviar.Recorder()
         tmpdir = tempfile.mkdtemp()
-        outpath = os.path.join(tmpdir, "toggle.mp4")
-        with patch("subprocess.Popen", return_value=self._mock_proc()):
+        outpath = os.path.join(tmpdir, "region.mp4")
+        captured_cmd: list[str] = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return self._mock_proc()
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            recorder.start(
+                outpath,
+                display=":99",
+                audio_source="default.monitor",
+                region=(100, 200, 1280, 720),
+            )
+
+        self.assertIn("-video_size", captured_cmd)
+        size_idx = captured_cmd.index("-video_size")
+        self.assertEqual(captured_cmd[size_idx + 1], "1280x720")
+
+        # The -i argument must encode the offset into the display string
+        self.assertIn(":99+100,200", captured_cmd)
+        recorder.stop()
+
+    def test_region_odd_dimensions_rounded_down(self) -> None:
+        """libx264 requires even dimensions; odd width/height must be rounded
+        down to the nearest even number before being passed to ffmpeg."""
+        recorder = qemu_caviar.Recorder()
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "odd.mp4")
+        captured_cmd: list[str] = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return self._mock_proc()
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            recorder.start(
+                outpath,
+                display=":0",
+                audio_source="default.monitor",
+                region=(0, 0, 1281, 721),
+            )
+
+        size_idx = captured_cmd.index("-video_size")
+        # 1281 → 1280, 721 → 720
+        self.assertEqual(captured_cmd[size_idx + 1], "1280x720")
+        recorder.stop()
+
+    def test_no_region_no_video_size_flag(self) -> None:
+        """When no region is given, -video_size must NOT appear in the command
+        so that the full display is captured."""
+        recorder = qemu_caviar.Recorder()
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "full.mp4")
+        captured_cmd: list[str] = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return self._mock_proc()
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            recorder.start(outpath, display=":0", audio_source="default.monitor")
+
+        self.assertNotIn("-video_size", captured_cmd)
+        # The display string must appear without an offset
+        self.assertIn(":0", captured_cmd)
+        recorder.stop()
+
+    def test_toggle_forwards_region(self) -> None:
+        """toggle() must pass the region through to start()."""
+        recorder = qemu_caviar.Recorder()
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "toggle_region.mp4")
+        captured_cmd: list[str] = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return self._mock_proc()
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
             with patch.object(
                 qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
             ):
-                started = recorder.toggle(outpath, display=":99")
-        self.assertTrue(started)
-        stopped = recorder.toggle(outpath, display=":99")
-        self.assertFalse(stopped)
+                recorder.toggle(outpath, display=":0", region=(10, 20, 800, 600))
+
+        self.assertIn("-video_size", captured_cmd)
+        size_idx = captured_cmd.index("-video_size")
+        self.assertEqual(captured_cmd[size_idx + 1], "800x600")
+        recorder.stop()
+
+
+# ---------------------------------------------------------------------------
+# _get_qemu_window_geometry tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetQemuWindowGeometry(unittest.TestCase):
+    def test_returns_geometry_when_xdotool_succeeds(self) -> None:
+        xdotool_search_out = "123456\n"
+        xdotool_geo_out = "X=100\nY=200\nWIDTH=1280\nHEIGHT=720\nSCREEN=0\n"
+        with patch(
+            "subprocess.check_output",
+            side_effect=[xdotool_search_out, xdotool_geo_out],
+        ):
+            result = qemu_caviar._get_qemu_window_geometry(9999)
+        self.assertEqual(result, (100, 200, 1280, 720))
+
+    def test_returns_none_when_no_windows_found(self) -> None:
+        with patch("subprocess.check_output", return_value=""):
+            result = qemu_caviar._get_qemu_window_geometry(9999)
+        self.assertIsNone(result)
+
+    def test_returns_none_when_xdotool_missing(self) -> None:
+        with patch(
+            "subprocess.check_output",
+            side_effect=FileNotFoundError("xdotool"),
+        ):
+            result = qemu_caviar._get_qemu_window_geometry(9999)
+        self.assertIsNone(result)
+
+    def test_returns_none_when_xdotool_fails(self) -> None:
+        with patch(
+            "subprocess.check_output",
+            side_effect=subprocess.CalledProcessError(1, "xdotool"),
+        ):
+            result = qemu_caviar._get_qemu_window_geometry(9999)
+        self.assertIsNone(result)
+
+    def test_uses_last_window_id_when_multiple_returned(self) -> None:
+        """QEMU may create multiple windows; the last visible one is the display."""
+        xdotool_search_out = "111\n222\n333\n"
+        xdotool_geo_out = "X=50\nY=60\nWIDTH=640\nHEIGHT=480\nSCREEN=0\n"
+        captured_calls: list = []
+
+        def fake_check_output(cmd, **kwargs):
+            captured_calls.append(list(cmd))
+            if "search" in cmd:
+                return xdotool_search_out
+            return xdotool_geo_out
+
+        with patch("subprocess.check_output", side_effect=fake_check_output):
+            result = qemu_caviar._get_qemu_window_geometry(1234)
+
+        # Second call (getwindowgeometry) must use the last ID ("333")
+        geo_call = captured_calls[1]
+        self.assertIn("333", geo_call)
+        self.assertEqual(result, (50, 60, 640, 480))
 
 
 # ---------------------------------------------------------------------------

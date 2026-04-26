@@ -128,6 +128,50 @@ def _video_filename(output_dir: str) -> str:
     return os.path.join(output_dir, name)
 
 
+def _get_qemu_window_geometry(pid: int) -> tuple[int, int, int, int] | None:
+    """Return (x, y, width, height) of the QEMU display window for *pid*.
+
+    Uses ``xdotool`` to locate the visible window owned by *pid* and read its
+    absolute position and size on the screen.  These coordinates can be passed
+    directly to the ffmpeg x11grab input to restrict capture to just the QEMU
+    window instead of the whole screen.
+
+    Returns None if the window cannot be found or ``xdotool`` is unavailable
+    (in which case the caller should fall back to full-screen capture).
+    """
+    try:
+        win_ids_raw = subprocess.check_output(
+            ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).splitlines()
+        win_ids = [w.strip() for w in win_ids_raw if w.strip()]
+        if not win_ids:
+            return None
+        # QEMU may create more than one window; the last visible one is the
+        # display window.
+        win_id = win_ids[-1]
+        geo = subprocess.check_output(
+            ["xdotool", "getwindowgeometry", "--shell", win_id],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        # Output format: X=…\nY=…\nWIDTH=…\nHEIGHT=…\nSCREEN=…\n
+        vals: dict[str, int] = {}
+        for line in geo.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                try:
+                    vals[k.strip()] = int(v.strip())
+                except ValueError:
+                    pass
+        if {"X", "Y", "WIDTH", "HEIGHT"}.issubset(vals):
+            return vals["X"], vals["Y"], vals["WIDTH"], vals["HEIGHT"]
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    return None
+
+
 def _find_vm_audio_source() -> str:
     """Return a PulseAudio source name that captures the VM's audio output.
 
@@ -178,12 +222,24 @@ class Recorder:
         self.recording: bool = False
 
     # ------------------------------------------------------------------
-    def start(self, output_path: str, display: str = ":0", audio_source: str | None = None) -> bool:
+    def start(
+        self,
+        output_path: str,
+        display: str = ":0",
+        audio_source: str | None = None,
+        region: tuple[int, int, int, int] | None = None,
+    ) -> bool:
         """Start recording to *output_path*.  Returns True on success.
 
         *audio_source* is a PulseAudio source name (e.g. a sink monitor).
         If None, :func:`_find_vm_audio_source` is called automatically so
         that the recorded audio comes from the VM rather than the host mic.
+
+        *region* is an optional ``(x, y, width, height)`` tuple that restricts
+        the x11grab capture to a sub-region of *display*.  Pass the geometry
+        of the QEMU window (obtained via :func:`_get_qemu_window_geometry`) to
+        record only the VM display instead of the whole screen.  When *region*
+        is None the entire display is captured.
         """
         if self.recording:
             print("[recorder] already recording", file=sys.stderr)
@@ -192,13 +248,25 @@ class Recorder:
         if audio_source is None:
             audio_source = _find_vm_audio_source()
 
+        # Build the x11grab video input arguments.  When a region is given,
+        # restrict capture to that sub-rectangle of the display so that only
+        # the QEMU window is recorded.  libx264 requires even dimensions, so
+        # round width/height down to the nearest even number.
+        if region is not None:
+            x, y, w, h = region
+            w = w - (w % 2)
+            h = h - (h % 2)
+            video_input = ["-video_size", f"{w}x{h}", "-i", f"{display}+{x},{y}"]
+        else:
+            video_input = ["-i", display]
+
         cmd = [
             "ffmpeg",
             "-y",
-            # Video: grab the whole X11 display
+            # Video: grab the QEMU window area (or the whole display as fallback)
             "-f", "x11grab",
             "-framerate", "30",
-            "-i", display,
+            *video_input,
             # Audio: monitor of the PulseAudio sink that QEMU writes to,
             # so we capture what the VM is playing rather than the host mic.
             "-f", "pulse",
@@ -252,14 +320,20 @@ class Recorder:
         return outfile
 
     # ------------------------------------------------------------------
-    def toggle(self, output_path: str, display: str = ":0", audio_source: str | None = None) -> bool | None:
+    def toggle(
+        self,
+        output_path: str,
+        display: str = ":0",
+        audio_source: str | None = None,
+        region: tuple[int, int, int, int] | None = None,
+    ) -> bool | None:
         """Toggle recording on/off.  Returns True when started, False when
         stopped, None on error."""
         if self.recording:
             result = self.stop()
             return False if result is not None else None
         else:
-            return self.start(output_path, display, audio_source)
+            return self.start(output_path, display, audio_source, region)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +389,9 @@ class ControlWindow(Gtk.ApplicationWindow):
         self._output_dir = output_dir
         self._qmp = qmp
         self._recorder = Recorder()
+        # PID of the QEMU process; set by QemuCaviarApp once QEMU has started.
+        # Used to look up the QEMU window geometry for window-scoped recording.
+        self._qemu_pid: int | None = None
 
         self.set_default_size(320, 80)
         self.set_resizable(False)
@@ -394,6 +471,11 @@ class ControlWindow(Gtk.ApplicationWindow):
         GLib.idle_add(self._status_label.set_text, text)
 
     # ------------------------------------------------------------------
+    def set_qemu_pid(self, pid: int) -> None:
+        """Set the PID of the QEMU process for window-geometry lookup."""
+        self._qemu_pid = pid
+
+    # ------------------------------------------------------------------
     def _on_screenshot(self, _widget) -> None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = os.path.join(
@@ -438,10 +520,14 @@ class ControlWindow(Gtk.ApplicationWindow):
             threading.Thread(target=_stop_in_thread, daemon=True).start()
             self._set_status("Stopping recording…")
         else:
-            # Start
+            # Start – restrict capture to the QEMU window when its geometry
+            # is available; fall back to the full display otherwise.
             outfile = _video_filename(self._output_dir)
             display = os.environ.get("DISPLAY", ":0")
-            ok = self._recorder.start(outfile, display)
+            region: tuple[int, int, int, int] | None = None
+            if self._qemu_pid is not None:
+                region = _get_qemu_window_geometry(self._qemu_pid)
+            ok = self._recorder.start(outfile, display, region=region)
             if ok:
                 self._set_status(f"Recording… → {os.path.basename(outfile)}")
                 self._rec_toggle_item.set_label("_Stop Recording")
@@ -534,6 +620,11 @@ class QemuCaviarApp(Gtk.Application):
                 )
             )
             return
+
+        # Share the QEMU PID with the control window so it can find the
+        # QEMU display window for window-scoped video recording.
+        if self._win:
+            GLib.idle_add(self._win.set_qemu_pid, self._qemu_proc.pid)
 
         # Connect QMP
         qmp = QMPClient(self._qmp_socket_path)
