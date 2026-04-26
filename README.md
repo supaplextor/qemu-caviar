@@ -28,7 +28,7 @@ qemu-caviar [--vm-name NAME] [--output-dir DIR] [-- QEMU_ARGS...]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--vm-name NAME` | `qemu-vm` | Label used in the window title and output filenames |
-| `--output-dir DIR` | `$HOME` | Directory where screenshots and recordings are saved |
+| `--output-dir DIR` | `$PWD` | Directory where screenshots and recordings are saved |
 | `--` | – | Everything after this separator is forwarded to `qemu-system-x86_64` |
 
 ### Examples

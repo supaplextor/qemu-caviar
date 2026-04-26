@@ -7,7 +7,7 @@ Usage:
 
 Options:
     --vm-name NAME      Label shown in the window title and output filenames.
-    --output-dir DIR    Directory for screenshots / recordings (default: $HOME).
+    --output-dir DIR    Directory for screenshots / recordings (default: $PWD).
     --                  Everything after this separator is forwarded verbatim
                         to qemu-system-x86_64.
 
@@ -602,9 +602,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(Path.home()),
+        default=str(Path.cwd()),
         metavar="DIR",
-        help="Directory for screenshots and recordings (default: $HOME)",
+        help="Directory for screenshots and recordings (default: $PWD)",
     )
     return parser
 
