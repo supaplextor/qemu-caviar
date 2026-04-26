@@ -12,11 +12,12 @@ QEMU/KVM launcher with a **GTK control window** that provides:
 | `qemu-system-x86` | QEMU/KVM hypervisor |
 | `python3-gi` + `gir1.2-gtk-3.0` | GTK3 Python bindings |
 | `ffmpeg` | Video/audio recording (optional) |
+| `xdotool` | Window geometry lookup for window-scoped recording (optional) |
 
 Install on Ubuntu/Debian:
 
 ```bash
-sudo apt install qemu-system-x86 python3-gi gir1.2-gtk-3.0 ffmpeg
+sudo apt install qemu-system-x86 python3-gi gir1.2-gtk-3.0 ffmpeg xdotool
 ```
 
 ## Usage
@@ -63,7 +64,7 @@ A small floating GTK window opens alongside the QEMU display:
 ## How it works
 
 1. **QMP** – QEMU is started with `-qmp unix:<socket>,server,nowait`. `qemu-caviar` connects to that socket and issues a `screendump` command when you choose *Save Screenshot*.
-2. **Recording** – `ffmpeg` is invoked with `-f x11grab` (X11 display capture) and `-f pulse` pointed at the PulseAudio *monitor* of the sink QEMU writes to, capturing the VM's audio output rather than the host microphone. The streams are encoded as H.264 video + AAC audio inside an MP4 container.
+2. **Recording** – `ffmpeg` is invoked with `-f x11grab` (X11 display capture) restricted to the QEMU window's position and size (obtained via `xdotool`), and `-f pulse` pointed at the PulseAudio *monitor* of the sink QEMU writes to, capturing the VM's audio output rather than the host microphone. The streams are encoded as H.264 video + AAC audio inside an MP4 container. If `xdotool` is not available or the window cannot be found, the entire display is captured as a fallback.
 
 ## Output files
 
