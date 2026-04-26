@@ -230,7 +230,7 @@ def _run_geometry_watcher(
 ) -> None:
     """Core geometry-watcher loop; intended to run in a background thread.
 
-    Polls the QEMU window geometry every :data:`_GEOMETRY_POLL_INTERVAL`
+    Polls the QEMU window geometry every ``_GEOMETRY_POLL_INTERVAL``
     seconds.  When the window is resized or moved the current recording is
     stopped and a new one is started with the updated region so that the
     capture always matches the actual QEMU display area.
