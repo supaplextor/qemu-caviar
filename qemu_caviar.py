@@ -492,6 +492,22 @@ class QemuCaviarApp(Gtk.Application):
             qmp=None,  # will be set once QMP connects
         )
         self._win.show_all()
+        self._place_control_window()
+
+    # ------------------------------------------------------------------
+    def _place_control_window(self) -> None:
+        """Move the control window to the top-right corner of the primary
+        monitor so it does not overlap with the QEMU display window (which
+        typically opens in the centre of the screen)."""
+        if self._win is None:
+            return
+        screen = self._win.get_screen()
+        monitor_idx = screen.get_primary_monitor()
+        geo = screen.get_monitor_geometry(monitor_idx)
+        win_w, _ = self._win.get_size()
+        x = geo.x + geo.width - win_w - 8
+        y = geo.y + 8
+        self._win.move(x, y)
 
     # ------------------------------------------------------------------
     def _start_qemu(self) -> None:
