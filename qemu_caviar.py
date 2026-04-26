@@ -496,10 +496,9 @@ class QemuCaviarApp(Gtk.Application):
         self._qmp_socket_path = os.path.join(tmpdir, "qmp.sock")
 
         cmd = (
-            ["qemu-system-x86_64"]
+            ["kvm"]
             + self._qemu_args
             + [
-                "-enable-kvm",
                 "-qmp", f"unix:{self._qmp_socket_path},server,nowait",
             ]
         )
