@@ -63,11 +63,11 @@ A small floating GTK window opens alongside the QEMU display:
 ## How it works
 
 1. **QMP** – QEMU is started with `-qmp unix:<socket>,server,nowait`. `qemu-caviar` connects to that socket and issues a `screendump` command when you choose *Save Screenshot*.
-2. **Recording** – `ffmpeg` is invoked with `-f x11grab` (X11 display capture) and `-f pulse` (PulseAudio). The streams are encoded as H.264 video + AAC audio inside an MP4 container.
+2. **Recording** – `ffmpeg` is invoked with `-f x11grab` (X11 display capture) and `-f pulse` pointed at the PulseAudio *monitor* of the sink QEMU writes to, capturing the VM's audio output rather than the host microphone. The streams are encoded as H.264 video + AAC audio inside an MP4 container.
 
 ## Output files
 
 | File | Description |
 |------|-------------|
 | `<vm-name>-screenshot-<YYYYMMDD_HHMMSS>.png` | PNG framebuffer dump |
-| `<vm-name>-recording-<YYYYMMDD_HHMMSS>.mp4` | MP4 video/audio recording |
+| `qemu-video-<YYYYMMDD>-<HHMMSS>.<NS>.mp4` | MP4 video recording with VM audio (NS = nanoseconds) |

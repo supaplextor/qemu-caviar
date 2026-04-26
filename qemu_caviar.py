@@ -18,6 +18,7 @@ Menu shortcuts (control window):
 """
 
 import argparse
+import datetime
 import json
 import os
 import signal
@@ -109,6 +110,60 @@ class QMPClient:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _video_filename(output_dir: str) -> str:
+    """Return an output path using the format qemu-video-YYYYMMDD-HHMMSS.NS.mp4.
+
+    A single call to time.time_ns() is used as the sole time source so the
+    date/time components and the nanosecond component are always consistent,
+    even when the call straddles a second boundary.
+    """
+    ns_now = time.time_ns()
+    dt = datetime.datetime.fromtimestamp(ns_now / 1e9)
+    ns_part = ns_now % 1_000_000_000
+    name = f"qemu-video-{dt.strftime('%Y%m%d-%H%M%S')}.{ns_part:09d}.mp4"
+    return os.path.join(output_dir, name)
+
+
+def _find_vm_audio_source() -> str:
+    """Return a PulseAudio source name that captures the VM's audio output.
+
+    QEMU writes audio to PulseAudio.  To record what the VM is playing (rather
+    than the host microphone) we use the *monitor* of the PulseAudio sink that
+    QEMU is using.  A sink monitor captures all audio routed to that sink.
+
+    Priority:
+      1. A sink whose name contains "qemu" (QEMU-specific sink)
+      2. The monitor of the system default sink
+      3. Hard-coded fallback "default.monitor"
+    """
+    try:
+        out = subprocess.check_output(
+            ["pactl", "list", "sinks", "short"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and "qemu" in parts[1].lower():
+                return parts[1] + ".monitor"
+        # Fall back to the monitor of the system default sink
+        default_sink = subprocess.check_output(
+            ["pactl", "get-default-sink"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if default_sink:
+            return default_sink + ".monitor"
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    return "default.monitor"
+
+
+# ---------------------------------------------------------------------------
 # Video / audio recorder
 # ---------------------------------------------------------------------------
 
@@ -123,11 +178,19 @@ class Recorder:
         self.recording: bool = False
 
     # ------------------------------------------------------------------
-    def start(self, output_path: str, display: str = ":0") -> bool:
-        """Start recording to *output_path*.  Returns True on success."""
+    def start(self, output_path: str, display: str = ":0", audio_source: str | None = None) -> bool:
+        """Start recording to *output_path*.  Returns True on success.
+
+        *audio_source* is a PulseAudio source name (e.g. a sink monitor).
+        If None, :func:`_find_vm_audio_source` is called automatically so
+        that the recorded audio comes from the VM rather than the host mic.
+        """
         if self.recording:
             print("[recorder] already recording", file=sys.stderr)
             return False
+
+        if audio_source is None:
+            audio_source = _find_vm_audio_source()
 
         cmd = [
             "ffmpeg",
@@ -136,10 +199,10 @@ class Recorder:
             "-f", "x11grab",
             "-framerate", "30",
             "-i", display,
-            # Audio: default PulseAudio source (optional – ffmpeg will warn
-            # but continue if no audio device is found)
+            # Audio: monitor of the PulseAudio sink that QEMU writes to,
+            # so we capture what the VM is playing rather than the host mic.
             "-f", "pulse",
-            "-i", "default",
+            "-i", audio_source,
             # Encode video with libx264 (fast preset) and audio with AAC
             "-c:v", "libx264",
             "-preset", "ultrafast",
@@ -185,14 +248,14 @@ class Recorder:
         return outfile
 
     # ------------------------------------------------------------------
-    def toggle(self, output_path: str, display: str = ":0") -> bool | None:
+    def toggle(self, output_path: str, display: str = ":0", audio_source: str | None = None) -> bool | None:
         """Toggle recording on/off.  Returns True when started, False when
         stopped, None on error."""
         if self.recording:
             result = self.stop()
             return False if result is not None else None
         else:
-            return self.start(output_path, display)
+            return self.start(output_path, display, audio_source)
 
 
 # ---------------------------------------------------------------------------
@@ -372,10 +435,7 @@ class ControlWindow(Gtk.ApplicationWindow):
             self._set_status("Stopping recording…")
         else:
             # Start
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            outfile = os.path.join(
-                self._output_dir, f"{self._vm_name}-recording-{timestamp}.mp4"
-            )
+            outfile = _video_filename(self._output_dir)
             display = os.environ.get("DISPLAY", ":0")
             ok = self._recorder.start(outfile, display)
             if ok:

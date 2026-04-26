@@ -3,6 +3,7 @@ parsing without requiring a running QEMU process, a real display, or ffmpeg."""
 
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -92,15 +93,17 @@ class TestQMPClient(unittest.TestCase):
 
     def test_execute_screendump(self) -> None:
         client = self._make_client()
+        tmpdir = tempfile.mkdtemp()
+        png_path = os.path.join(tmpdir, "test.png")
         self._server.queue_response({"return": {}})
-        result = client.screendump("/tmp/test.png")
+        result = client.screendump(png_path)
         self.assertIn("return", result)
         screendump_cmds = [
             c for c in self._server.received if c.get("execute") == "screendump"
         ]
         self.assertEqual(len(screendump_cmds), 1)
         self.assertEqual(
-            screendump_cmds[0]["arguments"]["filename"], "/tmp/test.png"
+            screendump_cmds[0]["arguments"]["filename"], png_path
         )
         client.close()
 
@@ -116,45 +119,132 @@ class TestQMPClient(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _video_filename tests
+# ---------------------------------------------------------------------------
+
+
+class TestVideoFilename(unittest.TestCase):
+    _PATTERN = re.compile(
+        r"qemu-video-\d{8}-\d{6}\.\d{9}\.mp4$"
+    )
+
+    def test_filename_format(self) -> None:
+        tmpdir = tempfile.mkdtemp()
+        path = qemu_caviar._video_filename(tmpdir)
+        self.assertEqual(os.path.dirname(path), tmpdir)
+        self.assertRegex(os.path.basename(path), self._PATTERN)
+
+    def test_unique_filenames(self) -> None:
+        """All 10 rapid-fire calls must produce distinct filenames."""
+        tmpdir = tempfile.mkdtemp()
+        paths = [qemu_caviar._video_filename(tmpdir) for _ in range(10)]
+        self.assertEqual(len(paths), len(set(paths)))
+
+
+# ---------------------------------------------------------------------------
+# _find_vm_audio_source tests
+# ---------------------------------------------------------------------------
+
+
+class TestFindVmAudioSource(unittest.TestCase):
+    def test_prefers_qemu_sink(self) -> None:
+        pactl_list = "0\tqemu-audio-sink\tRUNNING\n1\talsa_output.foo\tIDLE\n"
+        with patch(
+            "subprocess.check_output",
+            side_effect=[pactl_list, "alsa_output.foo"],
+        ):
+            src = qemu_caviar._find_vm_audio_source()
+        self.assertEqual(src, "qemu-audio-sink.monitor")
+
+    def test_falls_back_to_default_sink(self) -> None:
+        pactl_list = "0\talsa_output.pci.analog-stereo\tRUNNING\n"
+        default_sink = "alsa_output.pci.analog-stereo"
+        with patch(
+            "subprocess.check_output",
+            side_effect=[pactl_list, default_sink],
+        ):
+            src = qemu_caviar._find_vm_audio_source()
+        self.assertEqual(src, "alsa_output.pci.analog-stereo.monitor")
+
+    def test_fallback_when_pactl_missing(self) -> None:
+        with patch(
+            "subprocess.check_output",
+            side_effect=FileNotFoundError("pactl"),
+        ):
+            src = qemu_caviar._find_vm_audio_source()
+        self.assertEqual(src, "default.monitor")
+
+
+# ---------------------------------------------------------------------------
 # Recorder tests
 # ---------------------------------------------------------------------------
 
 
 class TestRecorder(unittest.TestCase):
-    def test_start_stop_with_mock_ffmpeg(self) -> None:
-        recorder = qemu_caviar.Recorder()
-
+    def _mock_proc(self):
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.wait = MagicMock(return_value=0)
+        return mock_proc
 
-        with patch("subprocess.Popen", return_value=mock_proc):
-            ok = recorder.start("/tmp/test.mp4", display=":99")
+    def test_start_stop_with_mock_ffmpeg(self) -> None:
+        recorder = qemu_caviar.Recorder()
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "test.mp4")
+        with patch("subprocess.Popen", return_value=self._mock_proc()):
+            with patch.object(
+                qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
+            ):
+                ok = recorder.start(outpath, display=":99")
 
         self.assertTrue(ok)
         self.assertTrue(recorder.recording)
-        self.assertEqual(recorder._outfile, "/tmp/test.mp4")
+        self.assertEqual(recorder._outfile, outpath)
 
         outfile = recorder.stop()
-        self.assertEqual(outfile, "/tmp/test.mp4")
+        self.assertEqual(outfile, outpath)
         self.assertFalse(recorder.recording)
+
+    def test_explicit_audio_source_passed_to_ffmpeg(self) -> None:
+        """Verify the explicit audio_source overrides auto-detection."""
+        recorder = qemu_caviar.Recorder()
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "test.mp4")
+        captured_cmd: list[str] = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return self._mock_proc()
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            recorder.start(outpath, display=":99", audio_source="my-qemu-sink.monitor")
+
+        pulse_idx = captured_cmd.index("pulse") + 2  # "-f pulse -i <src>"
+        self.assertEqual(captured_cmd[pulse_idx], "my-qemu-sink.monitor")
+        recorder.stop()
 
     def test_start_without_ffmpeg(self) -> None:
         recorder = qemu_caviar.Recorder()
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "test.mp4")
         with patch("subprocess.Popen", side_effect=FileNotFoundError("ffmpeg")):
             with patch.object(qemu_caviar, "_show_error"):
-                ok = recorder.start("/tmp/test.mp4")
+                with patch.object(
+                    qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
+                ):
+                    ok = recorder.start(outpath)
         self.assertFalse(ok)
         self.assertFalse(recorder.recording)
 
     def test_double_start_rejected(self) -> None:
         recorder = qemu_caviar.Recorder()
-        mock_proc = MagicMock()
-        mock_proc.stdin = MagicMock()
-        mock_proc.wait = MagicMock(return_value=0)
-        with patch("subprocess.Popen", return_value=mock_proc):
-            recorder.start("/tmp/a.mp4")
-            ok = recorder.start("/tmp/b.mp4")
+        tmpdir = tempfile.mkdtemp()
+        with patch("subprocess.Popen", return_value=self._mock_proc()):
+            with patch.object(
+                qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
+            ):
+                recorder.start(os.path.join(tmpdir, "a.mp4"))
+                ok = recorder.start(os.path.join(tmpdir, "b.mp4"))
         self.assertFalse(ok)
         recorder.stop()
 
@@ -165,13 +255,15 @@ class TestRecorder(unittest.TestCase):
 
     def test_toggle_starts_then_stops(self) -> None:
         recorder = qemu_caviar.Recorder()
-        mock_proc = MagicMock()
-        mock_proc.stdin = MagicMock()
-        mock_proc.wait = MagicMock(return_value=0)
-        with patch("subprocess.Popen", return_value=mock_proc):
-            started = recorder.toggle("/tmp/toggle.mp4", display=":99")
+        tmpdir = tempfile.mkdtemp()
+        outpath = os.path.join(tmpdir, "toggle.mp4")
+        with patch("subprocess.Popen", return_value=self._mock_proc()):
+            with patch.object(
+                qemu_caviar, "_find_vm_audio_source", return_value="default.monitor"
+            ):
+                started = recorder.toggle(outpath, display=":99")
         self.assertTrue(started)
-        stopped = recorder.toggle("/tmp/toggle.mp4", display=":99")
+        stopped = recorder.toggle(outpath, display=":99")
         self.assertFalse(stopped)
 
 
@@ -202,8 +294,8 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(args.vm_name, "myserver")
 
     def test_custom_output_dir(self) -> None:
-        args, _ = self._parse(["--output-dir", "/tmp/captures"])
-        self.assertEqual(args.output_dir, "/tmp/captures")
+        args, _ = self._parse(["--output-dir", "/home/user/captures"])
+        self.assertEqual(args.output_dir, "/home/user/captures")
 
     def test_qemu_args_forwarded(self) -> None:
         _, qemu_args = self._parse(
@@ -219,3 +311,4 @@ class TestArgParser(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
