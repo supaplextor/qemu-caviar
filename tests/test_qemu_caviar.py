@@ -732,6 +732,85 @@ class TestRunGeometryWatcher(unittest.TestCase):
         recorder.stop()
 
 
+# ---------------------------------------------------------------------------
+# _pnm_to_png tests
+# ---------------------------------------------------------------------------
+
+
+class TestPnmToPng(unittest.TestCase):
+    def test_calls_pnmtopng_with_correct_streams(self) -> None:
+        """_pnm_to_png must open the source file for reading and the destination
+        file for writing, then pass them as stdin/stdout to pnmtopng."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "frame.pnm")
+            dst = os.path.join(tmpdir, "frame.png")
+            # Create a minimal placeholder source file.
+            with open(src, "wb") as f:
+                f.write(b"P6\n1 1\n255\n\xff\x00\x00")
+
+            captured: list[dict] = []
+
+            def fake_run(cmd, *, stdin, stdout, stderr, check):
+                captured.append({"cmd": cmd, "stdin": stdin, "stdout": stdout})
+                # Write a trivial byte so the destination file is non-empty.
+                stdout.write(b"\x89PNG")
+                return MagicMock(returncode=0)
+
+            with patch("subprocess.run", side_effect=fake_run):
+                qemu_caviar._pnm_to_png(src, dst)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["cmd"], ["pnmtopng"])
+
+    def test_raises_on_missing_pnmtopng(self) -> None:
+        """_pnm_to_png must propagate FileNotFoundError when pnmtopng is absent."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "frame.pnm")
+            dst = os.path.join(tmpdir, "frame.png")
+            with open(src, "wb") as f:
+                f.write(b"P6\n1 1\n255\n\xff\x00\x00")
+
+            with patch(
+                "subprocess.run", side_effect=FileNotFoundError("pnmtopng")
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    qemu_caviar._pnm_to_png(src, dst)
+
+    def test_raises_on_conversion_failure(self) -> None:
+        """_pnm_to_png must propagate CalledProcessError when pnmtopng exits
+        with a non-zero status."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "frame.pnm")
+            dst = os.path.join(tmpdir, "frame.png")
+            with open(src, "wb") as f:
+                f.write(b"not valid pnm data")
+
+            with patch(
+                "subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, "pnmtopng"),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    qemu_caviar._pnm_to_png(src, dst)
+
+    def test_roundtrip_produces_real_png(self) -> None:
+        """When pnmtopng is installed, converting a minimal P6 PPM must yield a
+        file whose first bytes are the PNG signature."""
+        import shutil
+
+        if shutil.which("pnmtopng") is None:
+            self.skipTest("pnmtopng not installed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "frame.pnm")
+            dst = os.path.join(tmpdir, "frame.png")
+            # Minimal 1×1 red pixel in P6 (binary PPM) format.
+            with open(src, "wb") as f:
+                f.write(b"P6\n1 1\n255\n\xff\x00\x00")
+            qemu_caviar._pnm_to_png(src, dst)
+            with open(dst, "rb") as f:
+                header = f.read(8)
+        self.assertEqual(header, b"\x89PNG\r\n\x1a\n")
+
+
 if __name__ == "__main__":
     unittest.main()
-

@@ -100,7 +100,12 @@ class QMPClient:
         return self._recv_object()
 
     def screendump(self, filename: str) -> dict:
-        """Ask QEMU to save the current framebuffer as a PNG file."""
+        """Ask QEMU to save the current framebuffer to *filename*.
+
+        QEMU always writes PNM (PPM) data regardless of the file extension.
+        Callers are responsible for converting the result to the desired image
+        format (e.g. PNG) after this call returns.
+        """
         return self.execute("screendump", filename=filename)
 
     # ------------------------------------------------------------------
@@ -206,6 +211,25 @@ def _find_vm_audio_source() -> str:
     except (FileNotFoundError, subprocess.CalledProcessError):
         pass
     return "default.monitor"
+
+
+def _pnm_to_png(src: str, dst: str) -> None:
+    """Convert a PNM file produced by QEMU's screendump to a PNG file.
+
+    Runs ``pnmtopng`` (from the netpbm package) as a subprocess, reading
+    the PNM data from *src* and writing PNG data to *dst*.
+
+    Raises :class:`FileNotFoundError` if ``pnmtopng`` is not installed and
+    :class:`subprocess.CalledProcessError` if the conversion fails.
+    """
+    with open(src, "rb") as pnm_file, open(dst, "wb") as png_file:
+        subprocess.run(
+            ["pnmtopng"],
+            stdin=pnm_file,
+            stdout=png_file,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
 
 
 # How often (in seconds) the geometry watcher polls the QEMU window position
@@ -555,19 +579,35 @@ class ControlWindow(Gtk.ApplicationWindow):
                 "Make sure QEMU was started with a -qmp socket.",
             )
             return
+        # QEMU's screendump always writes PNM (PPM) data regardless of the
+        # filename extension.  Dump to a temporary file first, then convert to
+        # a real PNG with pnmtopng.
+        with tempfile.NamedTemporaryFile(suffix=".pnm", delete=False) as tmp:
+            tmp_pnm = tmp.name
         try:
-            result = self._qmp.screendump(filename)
-        except OSError as exc:
-            _show_error("Screenshot failed", str(exc))
-            return
-        if "error" in result:
-            _show_error(
-                "Screenshot failed",
-                result["error"].get("desc", str(result["error"])),
-            )
-        else:
-            self._set_status(f"Screenshot saved: {os.path.basename(filename)}")
-            _show_info("Screenshot saved", filename)
+            try:
+                result = self._qmp.screendump(tmp_pnm)
+            except OSError as exc:
+                _show_error("Screenshot failed", str(exc))
+                return
+            if "error" in result:
+                _show_error(
+                    "Screenshot failed",
+                    result["error"].get("desc", str(result["error"])),
+                )
+                return
+            try:
+                _pnm_to_png(tmp_pnm, filename)
+            except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+                _show_error("Screenshot conversion failed", str(exc))
+                return
+        finally:
+            try:
+                os.unlink(tmp_pnm)
+            except OSError:
+                pass
+        self._set_status(f"Screenshot saved: {os.path.basename(filename)}")
+        _show_info("Screenshot saved", filename)
 
     # ------------------------------------------------------------------
     def _on_toggle_recording(self, _widget) -> None:
